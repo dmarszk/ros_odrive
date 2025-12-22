@@ -42,6 +42,7 @@ private:
     EpollEventLoop event_loop_;
     std::vector<Axis> axes_;
     std::string can_intf_name_;
+    bool hold_position_on_init_ = false;
     SocketCanIntf can_intf_;
     rclcpp::Time timestamp_;
 };
@@ -67,6 +68,7 @@ struct Axis {
     // uint8_t axis_state_ = 0;
     // uint8_t procedure_result_ = 0;
     // uint8_t trajectory_done_flag_ = 0;
+    bool init_position_held = false;
     double pos_estimate_ = NAN; // [rad]
     double vel_estimate_ = NAN; // [rad/s]
     // double iq_setpoint_ = NAN;
@@ -113,6 +115,8 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
     }
 
     can_intf_name_ = info_.hardware_parameters["can"];
+    hold_position_on_init_ = info_.hardware_parameters.count("hold_position_on_init") > 0 ?
+        (info_.hardware_parameters["hold_position_on_init"] == "true") : false;
 
     for (auto& joint : info_.joints) {
         axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
@@ -263,6 +267,28 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
     for (auto& axis : axes_) {
+        if (hold_position_on_init_ && !axis.init_position_held) {
+            // Hold current position until first update received
+            if (std::isnan(axis.pos_estimate_)) {
+                RCLCPP_WARN(
+                    rclcpp::get_logger("ODriveHardwareInterface"),
+                    "Axis %d: waiting for first position estimate...",
+                    axis.node_id_
+                );
+                continue;
+            } else {
+                RCLCPP_INFO(
+                    rclcpp::get_logger("ODriveHardwareInterface"),
+                    "Axis %d: received first position estimate, holding position at %.3f rad",
+                    axis.node_id_,
+                    axis.pos_estimate_
+                );
+                axis.pos_setpoint_ = axis.pos_estimate_;
+                axis.vel_setpoint_ = 0.0;
+                axis.torque_setpoint_ = 0.0;
+                axis.init_position_held = true;
+            }
+        }
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
