@@ -3,14 +3,92 @@
 #include "can_simple_messages.hpp"
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
+#include "odrive_endpoint_client.hpp"
 #include "odrive_enums.h"
 #include "pluginlib/class_list_macros.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "socket_can.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 namespace odrive_ros2_control {
 
+namespace {
+
+constexpr uint16_t kSetGpioEndpointId = 702;
+
+bool parse_bool_parameter(const std::unordered_map<std::string, std::string>& parameters, const std::string& key) {
+    const auto it = parameters.find(key);
+    if (it == parameters.end()) {
+        return false;
+    }
+
+    return it->second == "true" || it->second == "1";
+}
+
+} // namespace
+
 class Axis;
+
+struct ODriveEndpointSession {
+    ODriveEndpointSession(SocketCanIntf* can_intf, uint32_t node_id)
+        : node_id_(node_id), endpoint_client_(can_intf, node_id) {}
+
+    uint32_t node_id_;
+    ODriveEndpointClient endpoint_client_;
+};
+
+struct GpioOutput {
+    GpioOutput(std::string component_name, std::string interface_name, uint32_t node_id, uint32_t gpio_num, bool inverted)
+        : component_name_(std::move(component_name)),
+          interface_name_(std::move(interface_name)),
+          node_id_(node_id),
+          gpio_num_(gpio_num),
+          inverted_(inverted) {}
+
+    std::string component_name_;
+    std::string interface_name_;
+    uint32_t node_id_;
+    uint32_t gpio_num_;
+    bool inverted_ = false;
+    double command_ = 0.0;
+    double state_ = 0.0;
+    double last_sent_command_ = std::numeric_limits<double>::quiet_NaN();
+};
+
+struct SensorStateValue {
+    explicit SensorStateValue(std::string interface_name) : interface_name_(std::move(interface_name)) {}
+
+    std::string interface_name_;
+    double value_ = std::numeric_limits<double>::quiet_NaN();
+};
+
+struct TelemetrySensor {
+    TelemetrySensor(std::string component_name, uint32_t node_id)
+        : component_name_(std::move(component_name)), node_id_(node_id) {}
+
+    std::string component_name_;
+    uint32_t node_id_;
+    std::vector<SensorStateValue> state_values_;
+
+    void update_bus_measurements(double bus_voltage, double bus_current) {
+        for (auto& state_value : state_values_) {
+            if (state_value.interface_name_ == "bus_voltage") {
+                state_value.value_ = bus_voltage;
+            } else if (state_value.interface_name_ == "bus_current") {
+                state_value.value_ = bus_current;
+            }
+        }
+    }
+};
 
 class ODriveHardwareInterface final : public hardware_interface::SystemInterface {
 public:
@@ -37,10 +115,16 @@ public:
 private:
     void on_can_msg(const can_frame& frame);
     void set_axis_command_mode(const Axis& axis);
+    ODriveEndpointSession* find_endpoint_session(uint32_t node_id);
+    const GpioOutput* find_gpio_output(const std::string& component_name, const std::string& interface_name) const;
+    void ensure_endpoint_session(uint32_t node_id);
 
     bool active_;
     EpollEventLoop event_loop_;
     std::vector<Axis> axes_;
+    std::vector<ODriveEndpointSession> endpoint_sessions_;
+    std::vector<GpioOutput> gpio_outputs_;
+    std::vector<TelemetrySensor> telemetry_sensors_;
     std::string can_intf_name_;
     bool hold_position_on_init_ = false;
     SocketCanIntf can_intf_;
@@ -128,6 +212,58 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
         axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")), gear_ratio);
     }
 
+    for (const auto& gpio : info_.gpios) {
+        if (gpio.parameters.count("node_id") == 0) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "GPIO component %s is missing required node_id parameter",
+                gpio.name.c_str()
+            );
+            return CallbackReturn::ERROR;
+        }
+
+        const uint32_t node_id = static_cast<uint32_t>(std::stoul(gpio.parameters.at("node_id")));
+        ensure_endpoint_session(node_id);
+
+        for (const auto& command_interface : gpio.command_interfaces) {
+            const auto gpio_num_it = command_interface.parameters.find("gpio_num");
+            if (gpio_num_it == command_interface.parameters.end()) {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("ODriveHardwareInterface"),
+                    "GPIO interface %s/%s is missing required gpio_num parameter",
+                    gpio.name.c_str(),
+                    command_interface.name.c_str()
+                );
+                return CallbackReturn::ERROR;
+            }
+
+            gpio_outputs_.emplace_back(
+                gpio.name,
+                command_interface.name,
+                node_id,
+                static_cast<uint32_t>(std::stoul(gpio_num_it->second)),
+                parse_bool_parameter(command_interface.parameters, "inverted")
+            );
+        }
+    }
+
+    for (const auto& sensor : info_.sensors) {
+        if (sensor.parameters.count("node_id") == 0) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "Sensor component %s is missing required node_id parameter",
+                sensor.name.c_str()
+            );
+            return CallbackReturn::ERROR;
+        }
+
+        TelemetrySensor telemetry_sensor(sensor.name, static_cast<uint32_t>(std::stoul(sensor.parameters.at("node_id"))));
+        for (const auto& state_interface : sensor.state_interfaces) {
+            telemetry_sensor.state_values_.emplace_back(state_interface.name);
+        }
+        telemetry_sensors_.push_back(std::move(telemetry_sensor));
+    }
+
     return CallbackReturn::SUCCESS;
 }
 
@@ -158,6 +294,12 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
     active_ = true;
     for (auto& axis : axes_) {
         set_axis_command_mode(axis);
+    }
+    for (auto& endpoint_session : endpoint_sessions_) {
+        endpoint_session.endpoint_client_.invalidate_address();
+    }
+    for (auto& gpio_output : gpio_outputs_) {
+        gpio_output.last_sent_command_ = std::numeric_limits<double>::quiet_NaN();
     }
 
     return CallbackReturn::SUCCESS;
@@ -195,6 +337,28 @@ std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_
         ));
     }
 
+    for (const auto& gpio : info_.gpios) {
+        for (const auto& state_interface : gpio.state_interfaces) {
+            if (const GpioOutput* gpio_output = find_gpio_output(gpio.name, state_interface.name)) {
+                state_interfaces.emplace_back(hardware_interface::StateInterface(
+                    gpio.name,
+                    state_interface.name,
+                    const_cast<double*>(&gpio_output->state_)
+                ));
+            }
+        }
+    }
+
+    for (auto& telemetry_sensor : telemetry_sensors_) {
+        for (auto& state_value : telemetry_sensor.state_values_) {
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                telemetry_sensor.component_name_,
+                state_value.interface_name_,
+                &state_value.value_
+            ));
+        }
+    }
+
     return state_interfaces;
 }
 
@@ -216,6 +380,14 @@ std::vector<hardware_interface::CommandInterface> ODriveHardwareInterface::expor
             info_.joints[i].name,
             hardware_interface::HW_IF_POSITION,
             &axes_[i].pos_setpoint_
+        ));
+    }
+
+    for (auto& gpio_output : gpio_outputs_) {
+        command_interfaces.emplace_back(hardware_interface::CommandInterface(
+            gpio_output.component_name_,
+            gpio_output.interface_name_,
+            &gpio_output.command_
         ));
     }
 
@@ -316,14 +488,98 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         }
     }
 
+    for (auto& gpio_output : gpio_outputs_) {
+        const double requested_command = gpio_output.command_ >= 0.5 ? 1.0 : 0.0;
+        if (!std::isnan(gpio_output.last_sent_command_) && requested_command == gpio_output.last_sent_command_) {
+            gpio_output.state_ = requested_command;
+            continue;
+        }
+
+        ODriveEndpointSession* endpoint_session = find_endpoint_session(gpio_output.node_id_);
+        if (endpoint_session == nullptr) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "No endpoint session configured for GPIO %s/%s on node %u",
+                gpio_output.component_name_.c_str(),
+                gpio_output.interface_name_.c_str(),
+                gpio_output.node_id_
+            );
+            return return_type::ERROR;
+        }
+
+        const bool hardware_state = gpio_output.inverted_ ? (requested_command < 0.5) : (requested_command >= 0.5);
+        std::array<uint8_t, 5> payload = {};
+        const uint32_t gpio_num = gpio_output.gpio_num_;
+        std::memcpy(payload.data(), &gpio_num, sizeof(gpio_num));
+        payload[4] = hardware_state ? 1U : 0U;
+
+        if (!endpoint_session->endpoint_client_.call_function(kSetGpioEndpointId, payload)) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "Failed to send GPIO command for %s/%s on node %u",
+                gpio_output.component_name_.c_str(),
+                gpio_output.interface_name_.c_str(),
+                gpio_output.node_id_
+            );
+            return return_type::ERROR;
+        }
+
+        gpio_output.last_sent_command_ = requested_command;
+        gpio_output.state_ = requested_command;
+    }
+
     return return_type::OK;
 }
 
 void ODriveHardwareInterface::on_can_msg(const can_frame& frame) {
+    if ((frame.can_id & 0x1f) == Get_Bus_Voltage_Current_msg_t::cmd_id) {
+        if (frame.can_dlc < Get_Bus_Voltage_Current_msg_t::msg_length) {
+            RCLCPP_WARN(rclcpp::get_logger("ODriveHardwareInterface"), "message %d too short", frame.can_id & 0x1f);
+        } else {
+            Get_Bus_Voltage_Current_msg_t msg;
+            msg.decode_buf(frame.data);
+            const uint32_t node_id = frame.can_id >> 5;
+            for (auto& telemetry_sensor : telemetry_sensors_) {
+                if (telemetry_sensor.node_id_ == node_id) {
+                    telemetry_sensor.update_bus_measurements(msg.Bus_Voltage, msg.Bus_Current);
+                }
+            }
+        }
+    }
+
     for (auto& axis : axes_) {
         if ((frame.can_id >> 5) == axis.node_id_) {
             axis.on_can_msg(timestamp_, frame);
         }
+    }
+}
+
+ODriveEndpointSession* ODriveHardwareInterface::find_endpoint_session(uint32_t node_id) {
+    auto it = std::find_if(endpoint_sessions_.begin(), endpoint_sessions_.end(), [node_id](const ODriveEndpointSession& session) {
+        return session.node_id_ == node_id;
+    });
+    if (it == endpoint_sessions_.end()) {
+        return nullptr;
+    }
+    return &(*it);
+}
+
+const GpioOutput* ODriveHardwareInterface::find_gpio_output(
+    const std::string& component_name,
+    const std::string& interface_name
+) const {
+    auto it = std::find_if(gpio_outputs_.begin(), gpio_outputs_.end(), [&](const GpioOutput& gpio_output) {
+        return gpio_output.component_name_ == component_name && gpio_output.interface_name_ == interface_name;
+    });
+    if (it == gpio_outputs_.end()) {
+        return nullptr;
+    }
+    return &(*it);
+}
+
+void ODriveHardwareInterface::ensure_endpoint_session(uint32_t node_id) {
+    if (find_endpoint_session(node_id) == nullptr) {
+        endpoint_sessions_.emplace_back(&can_intf_, node_id);
     }
 }
 
