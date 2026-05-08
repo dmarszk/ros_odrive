@@ -23,7 +23,7 @@ namespace odrive_ros2_control {
 
 namespace {
 
-constexpr uint16_t kSetGpioEndpointId = 702;
+constexpr uint16_t kSetGpioEndpointId = 736;
 
 bool parse_bool_parameter(const std::unordered_map<std::string, std::string>& parameters, const std::string& key) {
     const auto it = parameters.find(key);
